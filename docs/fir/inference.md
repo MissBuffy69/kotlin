@@ -48,7 +48,9 @@ fun main() {
 ### Expected output
 
 - For all calls in the call-tree, for each type parameter, there should be a type argument chosen.
-- For all lambdas, all parameter/return types should be computed.
+- For all lambdas, all receiver/parameter/return types should be computed.
+
+**TODO:** Cover how we infer the function kind of lambda (regular/suspend/compose).
 
 ```kotlin
 fun main() {
@@ -97,22 +99,23 @@ fun main() {
 
     listOf( // Independent
         run { // Dependent
-            listOf() // Dependent
+            listOf("") // Independent
+            listOf("") // Dependent
         }
     )
 
-    list( // Independent
+    listOf( // Independent
         ""
     ).get(0) // Independent
 }
 ```
 
 **NB:** The calls that are used as receivers are being completed as `Independent` and it's crucial because our inference algorithm
-doesn't allow type-constraints flow back from the call to its receiver (like `mutablMapOf().put("", "")` is red code).
+doesn't allow type-constraints to flow back from the call to its receiver (like `mutableMapOf().put("", "")` is red code).
 
 See `org.jetbrains.kotlin.fir.resolve.ResolutionMode`.
 
-For the matter of inference, it affects if the calls are fully completed.
+One of the most important use cases for the resolution mode is defining whether a call should be **fully** [completed](#completion-mode).
 
 ### Constraint System Creation
 
@@ -159,7 +162,7 @@ Otherwise, if we've got a single perfect candidate, we choose it and go to the *
 The most basic example of such a constraint is that a value argument type must be a subtype of a parameter type.
 Or it might be an expected type in case like `val x: List<String> = listOf()` (initial constraint would be `List<Tv> <: List<String>`).
 
-Without loosing generality, we might say that all the initial constraints have form of `ArbitraryType1 <: ArbitraryType2`.
+Without losing generality, we might say that all the initial constraints have the form of `ArbitraryType1 <: ArbitraryType2`.
 
 And their main purpose is deriving *type variable constraints* (`Tv <: SomeType`, `SomeType <: Tv`, or `Tv := SomeType`).
 
@@ -352,7 +355,23 @@ Another reason might be relevant for [dependent](#context-dependency) calls: a t
 the return type of the call.
 The explanation for this rule is that this particular call is an argument of another call for which we don't know yet what candidate would
 be chosen.
-Thus don't know a proper expected type that might in fact contradict to the chosen result type.
+Thus don't know a proper expected type that might in fact contradict the chosen result type.
+
+```kotlin
+fun foo(x: MutableList<Any>, y: Int) {}
+fun foo(x: MutableList<String>, y: String) {}
+
+fun main() {
+    // Resolved to the first overload
+    foo(
+        // String <: Tv
+        // Potentially, we might've fixed Tv to String when resolving `mutableListOf("")`.
+        // But that would lead to `MutableList<String> <: MutableList<Int>` contradiction
+        mutableListOf(""),
+        1
+    )
+}
+```
 
 #### Variables order
 
@@ -382,8 +401,8 @@ Once the variable is chosen, we should decide to which result type it should be 
 - The list of constraints for the type variable (at least one of them must be proper)
 - Constraints of other type variables that potentially might be related
 
-At first, we look if there are some `EQUAL` constraints and choose first of them which don't contain integer literal types
-(**NB:** anyway all of them should not contradict to each other, so in some broad sense all such constraints are equal).
+At first, we look if there are some `EQUAL` constraints and choose first of them which doesn't contain integer literal types
+(**NB:** anyway all of them should not contradict each other, so in some broad sense all such constraints are equal).
 
 Otherwise, we choose a representative **subtype** and **supertype** if applicable.
 
@@ -393,6 +412,28 @@ of all the lower constraints, but it should be as "precise" as possible (see `Ne
 
 In case of non-proper lower constraints, we replace type variables in them with special *stub types* which behave like they're equal to
 anything.
+
+For example, here:
+
+```kotlin
+fun <F> select(f1: F, f2: F): F = TODO()
+
+fun main() {
+    select(
+        // MutableList<String> <: Fv
+        mutableListOf<String>(),
+        // List<Tv> <: Fv
+        emptyList()
+    )
+}
+```
+
+We don't yet have simple constraints for fixing `Tv`, so going to fix `Fv` first:
+
+- It has two lower constraints: `List<Tv>` (`List<StubType>` after stub-type substitution) and `MutableList<String>`.
+- Their common supertype is computed to `List<String>` (with the help of specially defined equality on stub-types).
+- Thus, we fix `Fv := List<String>` and then `Tv := String`.
+
 We don't cover that part extensively here, but it's guaranteed that the resulting type would not contain nor a type variable or a stub type.
 
 For more details, look into `ResultTypeResolver.findSubType`
