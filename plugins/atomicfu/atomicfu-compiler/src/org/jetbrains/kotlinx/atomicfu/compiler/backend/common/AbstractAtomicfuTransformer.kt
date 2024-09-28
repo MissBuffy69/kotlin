@@ -385,19 +385,6 @@ abstract class AbstractAtomicfuTransformer(
                 val typeRemapper = IrTypeParameterRemapper(atomicExtension.typeParameters.associateWith { this.typeParameters[it.index] })
                 remapTypes(typeRemapper)
             }
-
-        private fun IrFunction.isAtomicExtension(): Boolean =
-            if (extensionReceiverParameter != null && extensionReceiverParameter!!.type.isAtomicType()) {
-                require(this.isInline) {
-                    "Non-inline extension functions on kotlinx.atomicfu.Atomic* classes are not allowed, " +
-                            "please add inline modifier to the function ${this.render()}."
-                }
-                require(this.visibility == DescriptorVisibilities.PRIVATE || this.visibility == DescriptorVisibilities.INTERNAL) {
-                    "Only private or internal extension functions on kotlinx.atomicfu.Atomic* classes are allowed, " +
-                            "please make the extension function ${this.render()} private or internal."
-                }
-                true
-            } else false
     }
 
     abstract inner class AtomicFunctionCallTransformer : IrElementTransformer<IrFunction?> {
@@ -693,7 +680,7 @@ abstract class AbstractAtomicfuTransformer(
                     symbol.owner.name.asString() == APPEND &&
                     symbol.owner.dispatchReceiverParameter?.type?.isTraceBaseType() == true
 
-        private val IrFunction.containingFunction: IrFunction
+        private val IrFunction.firstNonLocalFunctionForLambdaParent: IrFunction
             get() {
                 if (this.origin != IrDeclarationOrigin.LOCAL_FUNCTION_FOR_LAMBDA) return this
                 return parents.filterIsInstance<IrFunction>().firstOrNull {
@@ -701,11 +688,23 @@ abstract class AbstractAtomicfuTransformer(
                 }
                     ?: error("In the sequence of parents for the local function ${this.render()} no containing function was found" + CONSTRAINTS_MESSAGE)
             }
-
-        internal fun IrFunction.isTransformedAtomicExtension(): Boolean =
-            name.asString().contains("\$$ATOMICFU") && valueParameters.isNotEmpty() && valueParameters[0].name.asString() == ATOMIC_HANDLER
     }
 
+    /**
+     * At the first stage [AtomicExtensionTransformer] replaced atomic extensions with the new functions,
+     * which have new generated value parameters in their signatures, e.g.:
+     * instead of `AtomicInt.foo(arg: Int)`, `foo$atomicfu(atomicArray: AtomicIntArray, index: Int, arg: Int)` was generated.
+     * the bodies for the transformed functions were copied from the original function.
+     *
+     * At the next stage [AtomicFunctionCallTransformer] transformed the bodies of these functions:
+     * e.g. { this.compareAndSet(value, arg) } -> { atomicArray.compareAndSet(index, value, arg) }
+     *
+     * Note, that `arg` value parameter still has an original function as it's parent,
+     * so the parent should be changed for the new transformed declaration.
+     * This is done by [RemapValueParameters] transformer.
+     *
+     * It's launched as a separate transformation stage to avoid recursive visiting.
+     */
     private inner class RemapValueParameters : IrElementTransformer<IrFunction?> {
 
         override fun visitFunction(declaration: IrFunction, data: IrFunction?): IrStatement {
@@ -735,7 +734,7 @@ abstract class AbstractAtomicfuTransformer(
                         ?: error("Failed to find a transformed atomic extension parent function for ${this.render()}.")
 
         private fun IrValueParameter.remapValueParameters(transformedExtension: IrFunction): IrValueParameter? {
-            if (index < 0 && !type.isAtomicValueType()) {
+            if (index < 0 && !type.isAtomicType()) {
                 // data is a transformed function
                 // index == -1 for `this` parameter
                 return transformedExtension.dispatchReceiverParameter
@@ -825,6 +824,22 @@ abstract class AbstractAtomicfuTransformer(
         classFqName?.let {
             it.parent().asString() == AFU_PKG && it.shortName().asString() in ATOMIC_ARRAY_TYPES
         } ?: false
+
+    private fun IrFunction.isAtomicExtension(): Boolean =
+        if (extensionReceiverParameter != null && extensionReceiverParameter!!.type.isAtomicType()) {
+            require(this.isInline) {
+                "Non-inline extension functions on kotlinx.atomicfu.Atomic* classes are not allowed, " +
+                        "please add inline modifier to the function ${this.render()}."
+            }
+            require(this.visibility == DescriptorVisibilities.PRIVATE || this.visibility == DescriptorVisibilities.INTERNAL) {
+                "Only private or internal extension functions on kotlinx.atomicfu.Atomic* classes are allowed, " +
+                        "please make the extension function ${this.render()} private or internal."
+            }
+            true
+        } else false
+
+    internal fun IrFunction.isTransformedAtomicExtension(): Boolean =
+        name.asString().contains("\$$ATOMICFU") && valueParameters.isNotEmpty() && valueParameters[0].name.asString() == ATOMIC_HANDLER
 
     private fun IrType.isTraceBaseType() =
         classFqName?.let {
